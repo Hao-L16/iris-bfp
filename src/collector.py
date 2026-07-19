@@ -6,7 +6,6 @@ from einops import rearrange
 import numpy as np
 import torch
 from tqdm import tqdm
-import wandb
 
 from agent import Agent
 from dataset import EpisodesDataset
@@ -83,7 +82,6 @@ class Collector:
                     self.episode_dir_manager.save(episode, episode_id, epoch)
                     metrics_episode = {k: v for k, v in episode.compute_metrics().__dict__.items()}
                     metrics_episode['episode_num'] = episode_id
-                    metrics_episode['action_histogram'] = wandb.Histogram(np_histogram=np.histogram(episode.actions.numpy(), bins=np.arange(0, self.env.num_actions + 1) - 0.5, density=True))
                     to_log.append({f'{self.dataset.name}/{k}': v for k, v in metrics_episode.items()})
                     returns.append(metrics_episode['episode_return'])
 

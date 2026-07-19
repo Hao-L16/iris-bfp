@@ -12,7 +12,6 @@ from omegaconf import DictConfig, OmegaConf
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-import wandb
 
 from agent import Agent
 from collector import Collector
@@ -26,13 +25,6 @@ from utils import configure_optimizer, EpisodeDirManager, set_seed
 
 class Trainer:
     def __init__(self, cfg: DictConfig) -> None:
-        wandb.init(
-            config=OmegaConf.to_container(cfg, resolve=True),
-            reinit=True,
-            resume=True,
-            **cfg.wandb
-        )
-
         if cfg.common.seed is not None:
             set_seed(cfg.common.seed)
 
@@ -50,7 +42,6 @@ class Trainer:
             config_path = config_dir / 'trainer.yaml'
             config_dir.mkdir(exist_ok=False, parents=False)
             shutil.copy('.hydra/config.yaml', config_path)
-            wandb.save(str(config_path))
             shutil.copytree(src=(Path(hydra.utils.get_original_cwd()) / "src"), dst="./src")
             shutil.copytree(src=(Path(hydra.utils.get_original_cwd()) / "scripts"), dst="./scripts")
             self.ckpt_dir.mkdir(exist_ok=False, parents=False)
@@ -120,7 +111,7 @@ class Trainer:
 
             to_log.append({'duration': (time.time() - start_time) / 3600})
             for metrics in to_log:
-                wandb.log({'epoch': epoch, **metrics})
+                print({'epoch': epoch, **metrics})
 
         self.finish()
 
@@ -236,7 +227,6 @@ class Trainer:
 
             metrics_episode = {k: v for k, v in episode.compute_metrics().__dict__.items()}
             metrics_episode['episode_num'] = episode_id
-            metrics_episode['action_histogram'] = wandb.Histogram(episode.actions.numpy(), num_bins=self.agent.world_model.act_vocab_size)
             to_log.append({f'{mode_str}/{k}': v for k, v in metrics_episode.items()})
 
         return to_log
@@ -279,4 +269,4 @@ class Trainer:
         return {k: batch[k].to(self.device) for k in batch}
 
     def finish(self) -> None:
-        wandb.finish()
+        pass
