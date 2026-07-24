@@ -1,21 +1,25 @@
 """
-plan() v5 — v3 plus three correctness fixes.
+test_plan_realenv.py — three modes in one harness for a like-for-like comparison.
 
-Fix A: the real loop now feeds clamp(tokenizer.encode_decode(obs)) to the
-       actor-critic, matching official agent.act. The actor was trained
-       entirely on VQ-VAE reconstructions, so feeding raw env frames put
-       it out of distribution and made the real LSTM memory mismatched
-       with the imagined rollouts that branch from it.
+  MODE = "actor"  : stock actor-critic only (temperature-0.5 sampling). Baseline.
+  MODE = "plan"   : v3 planner — enumerative one-step lookahead, score =
+                    discounted E[r] + gamma^H * alive * V(end). Decides by argmax.
+  MODE = "veto"   : safety veto — the actor decides by default; imagination only
+                    OVERRIDES when it predicts the actor's action is likely to
+                    lose a life AND a clearly safer action exists.
 
-Fix B/C: plan() no longer runs an actor forward at t=0. The first actions
-       are enumerated, so ac_out was unused there — and after Fix A the
-       t=0 imagined frame IS the same reconstruction the real loop just
-       showed the LSTM, so forwarding again advanced the memory twice per
-       real frame. Now: one LSTM advance per real frame.
+Why "veto": probe_death.py showed the world model predicts every life loss in
+advance (0/4 missed, median lead ~14 steps) with a clear safer alternative
+present (escape spread ~0.5), BUT it over-warns (p_death=1.0 fires dozens of
+times per episode vs 4 real deaths). So a naive "veto whenever p_death is high"
+would over-intervene. The veto therefore fires only when BOTH:
+  (1) p_death[actor_action] > VETO_THRESH        — the chosen action looks fatal
+  (2) min_a p_death[a] < p_death[actor_action] - ESCAPE_MARGIN  — escape exists.
+Otherwise the actor's action stands (either it's safe, or nothing is safer).
 
-Fix D: prints actor_pick (what the actor alone would choose on the real
-       frame) next to the planner's choice, so imagination's influence on
-       each decision is visible.
+Metrics reported: return, steps survived, life losses, and (veto mode) how many
+times the veto fired. Deaths-per-episode is the low-variance signal to watch;
+return is high-variance in Breakout so don't read too much into a single run.
 
 Run from repo root:
     PYTHONPATH=src python test_plan_realenv.py
@@ -35,18 +39,26 @@ from envs.world_model_env import WorldModelEnv
 from envs.wrappers import make_atari
 from utils import extract_state_dict
 
-DEVICE = "cpu"          # "cuda:0" on Colab
+DEVICE = "cpu"                  # "cuda:0" on Colab
 CHECKPOINT = "/home/lhao16/iris/checkpoints/last.pt"
-H = 5                   # imagination horizon
+MODE = "veto"                   # "actor" | "plan" | "veto"
+N_EPISODES = 20                 # episodes to average over
+N_STEPS = 2000                  # per-episode step cap (episode ends on its own first)
 GAMMA = 0.995
-TEMPERATURE = 0.5       # policy temperature for continuation actions
-N_STEPS = 60
+TEMPERATURE = 0.5
+
+# --- plan mode ---
+H = 5
+
+# --- veto mode (starting values; tune later) ---
+H_VETO = 15                     # imagination horizon for the death check
+VETO_THRESH = 0.7               # veto only if actor action's death prob exceeds this
+ESCAPE_MARGIN = 0.3             # ...and the safest action is at least this much lower
 
 
 @torch.no_grad()
-def imagination_step(wm_env, actions, use_argmax_obs=True):
-    """One imagined step: expected reward E[r]=P(+1)-P(-1), P(done),
-    argmax-generated next-obs tokens. Returns (obs, expected_reward, p_done)."""
+def imagination_step(wm_env, actions, want_reward=True):
+    """One imagined step. Returns (obs, E[r] or None, p_done). argmax obs tokens."""
     wm = wm_env.world_model
     n_obs_tok = wm_env.num_observations_tokens
     num_passes = 1 + n_obs_tok
@@ -56,82 +68,91 @@ def imagination_step(wm_env, actions, use_argmax_obs=True):
 
     token = actions.reshape(-1, 1)
     obs_tokens = []
-
+    exp_r = None
     for k in range(num_passes):
-        outputs_wm = wm(token, past_keys_values=wm_env.keys_values_wm)
-
+        out = wm(token, past_keys_values=wm_env.keys_values_wm)
         if k == 0:
-            probs_r = F.softmax(outputs_wm.logits_rewards, dim=-1).reshape(-1, 3)
-            expected_reward = probs_r[:, 2] - probs_r[:, 0]
-            probs_d = F.softmax(outputs_wm.logits_ends, dim=-1).reshape(-1, 2)
-            p_done = probs_d[:, 1]
-
+            if want_reward:
+                pr = F.softmax(out.logits_rewards, dim=-1).reshape(-1, 3)
+                exp_r = pr[:, 2] - pr[:, 0]
+            p_done = F.softmax(out.logits_ends, dim=-1).reshape(-1, 2)[:, 1]
         if k < n_obs_tok:
-            if use_argmax_obs:
-                token = outputs_wm.logits_observations.argmax(dim=-1)
-            else:
-                token = Categorical(logits=outputs_wm.logits_observations).sample()
+            token = out.logits_observations.argmax(dim=-1)
             obs_tokens.append(token)
-
     wm_env.obs_tokens = torch.cat(obs_tokens, dim=1)
     obs = wm_env.decode_obs_tokens()
-    return obs, expected_reward, p_done
+    return obs, exp_r, p_done
 
 
 @torch.no_grad()
-def plan(tokenizer, world_model, actor_critic, obs, device, num_actions, H, gamma,
-         actor_pick=None, verbose=False):
-    """
-    Enumerative one-step lookahead.
-      obs: (1,3,64,64) RAW current frame — wm_env encodes it, and the
-      reconstruction it decodes back is exactly the frame the caller
-      already showed the actor, which is why t=0 skips the actor forward.
-    """
-    K = num_actions
-    obs_K = obs.repeat(K, 1, 1, 1)
-    wm_env = WorldModelEnv(tokenizer, world_model, device)
-    imagined_obs = wm_env.reset_from_initial_observations(obs_K)
+def branch_memory(actor_critic, K):
+    saved = (actor_critic.hx, actor_critic.cx)
+    actor_critic.hx = saved[0].repeat(K, 1).clone()
+    actor_critic.cx = saved[1].repeat(K, 1).clone()
+    return saved
 
-    # Branch the real LSTM memory K ways.
-    saved_hx, saved_cx = actor_critic.hx, actor_critic.cx
-    actor_critic.hx = saved_hx.repeat(K, 1).clone()
-    actor_critic.cx = saved_cx.repeat(K, 1).clone()
+
+@torch.no_grad()
+def plan(tokenizer, world_model, actor_critic, obs, device, num_actions, H, gamma):
+    """v3 planner: returns the best first action by discounted return."""
+    K = num_actions
+    wm_env = WorldModelEnv(tokenizer, world_model, device)
+    imagined_obs = wm_env.reset_from_initial_observations(obs.repeat(K, 1, 1, 1))
+    saved = branch_memory(actor_critic, K)
 
     cum_reward = torch.zeros(K, device=device)
     alive = torch.ones(K, device=device)
     discount = 1.0
-
     for t in range(H):
         if t == 0:
-            # Enumerate: candidate k takes action k. No actor forward here —
-            # the caller already advanced the LSTM on this frame (Fix B/C).
             actions = torch.arange(K, device=device)
         else:
             ac_out = actor_critic(imagined_obs)
             actions = Categorical(
                 logits=ac_out.logits_actions.squeeze(1) / TEMPERATURE).sample()
-
         imagined_obs, exp_r, p_done = imagination_step(wm_env, actions)
         cum_reward = cum_reward + discount * alive * exp_r
         alive = alive * (1.0 - p_done)
         discount = discount * gamma
-
     final_value = actor_critic(imagined_obs).means_values.reshape(K)
     scores = cum_reward + discount * alive * final_value
 
-    best = scores.argmax()
-    chosen = best.reshape(1)
+    actor_critic.hx, actor_critic.cx = saved
+    return scores.argmax().reshape(1)
 
-    actor_critic.hx, actor_critic.cx = saved_hx, saved_cx
 
-    if verbose:
-        flag = "" if actor_pick is None or actor_pick == best.item() else "  <-- overrode"
-        print(f"  actor {actor_pick}  "
-              f"E[r]sum {[round(x, 4) for x in cum_reward.tolist()]}  "
-              f"V(end) {[round(x, 3) for x in final_value.tolist()]}  "
-              f"scores {[round(x, 4) for x in scores.tolist()]}  "
-              f"-> {best.item()}{flag}")
-    return chosen
+@torch.no_grad()
+def death_probs(tokenizer, world_model, actor_critic, obs, device, num_actions, h_veto):
+    """
+    For each first action, imagine h_veto steps following the actor and return
+    cumulative death probability (K,) = 1 - prod_t (1 - P(done)_t).
+    Does not affect the actor's memory (branch is restored).
+    """
+    K = num_actions
+    wm_env = WorldModelEnv(tokenizer, world_model, device)
+    imagined_obs = wm_env.reset_from_initial_observations(obs.repeat(K, 1, 1, 1))
+    saved = branch_memory(actor_critic, K)
+
+    survive = torch.ones(K, device=device)
+    for t in range(h_veto):
+        if t == 0:
+            actions = torch.arange(K, device=device)
+        else:
+            ac_out = actor_critic(imagined_obs)
+            actions = Categorical(
+                logits=ac_out.logits_actions.squeeze(1) / TEMPERATURE).sample()
+        imagined_obs, _, p_done = imagination_step(wm_env, actions, want_reward=False)
+        survive = survive * (1.0 - p_done)
+
+    actor_critic.hx, actor_critic.cx = saved
+    return 1.0 - survive
+
+
+def get_lives(env):
+    try:
+        return env.unwrapped.ale.lives()
+    except AttributeError:
+        return -1
 
 
 @hydra.main(config_path="config", config_name="trainer")
@@ -143,55 +164,97 @@ def main(cfg):
 
     sd = torch.load(CHECKPOINT, map_location=device)
     num_actions = extract_state_dict(sd, "actor_critic")["actor_linear.weight"].shape[0]
-    print(f"num_actions: {num_actions}")
+    print(f"MODE={MODE}, num_actions={num_actions}"
+          + (f", H_VETO={H_VETO}, VETO_THRESH={VETO_THRESH}, ESCAPE_MARGIN={ESCAPE_MARGIN}"
+             if MODE == "veto" else ""))
 
     world_model = WorldModel(obs_vocab_size=cfg.tokenizer.vocab_size,
                              act_vocab_size=num_actions, config=wm_config)
     actor_critic = ActorCritic(act_vocab_size=num_actions)
-
     tokenizer.load_state_dict(extract_state_dict(sd, "tokenizer"))
     world_model.load_state_dict(extract_state_dict(sd, "world_model"))
     actor_critic.load_state_dict(extract_state_dict(sd, "actor_critic"))
-
     tokenizer.to(device).eval()
     world_model.to(device).eval()
     actor_critic.to(device).eval()
 
-    env = make_atari('BreakoutNoFrameskip-v4')
-    obs = env.reset()
-    actor_critic.reset(n=1)
+    env = make_atari('BreakoutNoFrameskip-v4', noop_max=1, max_episode_steps=108000)
 
-    total_reward = 0.0
-    n_override = 0
-    for step in range(N_STEPS):
-        obs_t = torchvision.transforms.functional.to_tensor(obs).unsqueeze(0).to(device)
+    ep_returns, ep_deaths, ep_steps, ep_vetoes = [], [], [], []
 
-        with torch.no_grad():
-            # Fix A: same input distribution the actor was trained on, and the
-            # same frame plan() will imagine from.
-            input_ac = torch.clamp(
-                tokenizer.encode_decode(obs_t, should_preprocess=True,
-                                        should_postprocess=True), 0, 1)
-            ac_real = actor_critic(input_ac)          # the one LSTM advance
-            actor_pick = ac_real.logits_actions.squeeze(1).argmax(dim=-1).item()
+    for ep in range(N_EPISODES):
+        obs = env.reset()
+        actor_critic.reset(n=1)          # fresh LSTM memory per episode
+        prev_lives = get_lives(env)
+        total_reward = 0.0
+        n_veto = 0
+        n_deaths = 0
 
-        action = plan(tokenizer, world_model, actor_critic, obs_t, device,
-                      num_actions=num_actions, H=H, gamma=GAMMA,
-                      actor_pick=actor_pick, verbose=True)
-        if action.item() != actor_pick:
-            n_override += 1
+        for step in range(N_STEPS):
+            obs_t = torchvision.transforms.functional.to_tensor(obs).unsqueeze(0).to(device)
 
-        obs, reward, done, _ = env.step(action.item())
-        total_reward += reward
-        if reward != 0:
-            print(f"  *** step {step}: real reward {reward}! total={total_reward}")
-        if done:
-            print(f"episode ended at step {step}")
-            break
+            with torch.no_grad():
+                input_ac = torch.clamp(
+                    tokenizer.encode_decode(obs_t, should_preprocess=True,
+                                            should_postprocess=True), 0, 1)
+                ac_real = actor_critic(input_ac)               # one LSTM advance
+                logits = ac_real.logits_actions.squeeze(1)
+                actor_action = Categorical(logits=logits / TEMPERATURE).sample().item()
 
-    n = step + 1
-    print(f"\nOK — ran {n} real steps, total reward: {total_reward}")
-    print(f"planner overrode the actor on {n_override}/{n} steps ({100*n_override/n:.1f}%)")
+            if MODE == "actor":
+                action = actor_action
+            elif MODE == "plan":
+                action = plan(tokenizer, world_model, actor_critic, obs_t, device,
+                              num_actions, H, GAMMA).item()
+            elif MODE == "veto":
+                pd = death_probs(tokenizer, world_model, actor_critic, obs_t, device,
+                                 num_actions, H_VETO)
+                action = actor_action
+                safest = int(pd.argmin().item())
+                if (pd[actor_action] > VETO_THRESH
+                        and pd[actor_action] - pd[safest] > ESCAPE_MARGIN):
+                    action = safest
+                    n_veto += 1
+            else:
+                raise ValueError(MODE)
+
+            obs, reward, done, _ = env.step(action)
+            total_reward += reward
+            lives = get_lives(env)
+            if lives < prev_lives:
+                n_deaths += 1
+                prev_lives = lives
+            if done:
+                break
+
+        ep_returns.append(total_reward)
+        ep_deaths.append(n_deaths)
+        ep_steps.append(step + 1)
+        ep_vetoes.append(n_veto)
+        print(f"ep {ep+1:2d}/{N_EPISODES}: return {total_reward:5.0f}  "
+              f"deaths {n_deaths}  steps {step+1:4d}"
+              + (f"  vetoes {n_veto}" if MODE == "veto" else ""))
+
+    def stats(x):
+        x = torch.tensor(x, dtype=torch.float32)
+        n = x.numel()
+        mean = x.mean().item()
+        sem = (x.std(unbiased=True) / (n ** 0.5)).item() if n > 1 else 0.0
+        return mean, sem
+
+    r_mean, r_sem = stats(ep_returns)
+    d_mean, d_sem = stats(ep_deaths)
+    s_mean, _ = stats(ep_steps)
+    print(f"\n=== MODE={MODE}, {N_EPISODES} episodes ===")
+    print(f"return: mean {r_mean:.1f} +/- {r_sem:.1f} (sem)   "
+          f"median {sorted(ep_returns)[len(ep_returns)//2]:.0f}")
+    print(f"deaths: mean {d_mean:.2f} +/- {d_sem:.2f} (sem)")
+    print(f"steps:  mean {s_mean:.0f}")
+    if MODE == "veto":
+        v_mean, _ = stats(ep_vetoes)
+        print(f"vetoes: mean {v_mean:.1f} per episode")
+    print(f"raw returns: {[int(x) for x in ep_returns]}")
+    print(f"raw deaths:  {ep_deaths}")
 
 
 if __name__ == "__main__":
