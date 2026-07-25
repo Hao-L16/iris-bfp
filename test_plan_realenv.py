@@ -41,7 +41,7 @@ from utils import extract_state_dict
 
 DEVICE = "cpu"                  # "cuda:0" on Colab
 CHECKPOINT = "/home/lhao16/iris/checkpoints/last.pt"
-MODE = "veto"                   # "actor" | "plan" | "veto"
+MODE = "gate"                   # "actor" | "plan" | "veto" | "gate"
 N_EPISODES = 20                 # episodes to average over
 N_STEPS = 2000                  # per-episode step cap (episode ends on its own first)
 GAMMA = 0.995
@@ -54,6 +54,12 @@ H = 5
 H_VETO = 15                     # imagination horizon for the death check
 VETO_THRESH = 0.7               # veto only if actor action's death prob exceeds this
 ESCAPE_MARGIN = 0.3             # ...and the safest action is at least this much lower
+
+# --- gate mode ---
+# Use the planner's pick ONLY when its top score beats the runner-up by more than
+# SPREAD_THRESH (i.e. the evidence clears the noise floor); else defer to the actor.
+# Noise-level spreads were ~0.02-0.04, real signal ~0.5-3.0, so 0.3 sits between.
+SPREAD_THRESH = 0.3
 
 
 @torch.no_grad()
@@ -118,7 +124,7 @@ def plan(tokenizer, world_model, actor_critic, obs, device, num_actions, H, gamm
     scores = cum_reward + discount * alive * final_value
 
     actor_critic.hx, actor_critic.cx = saved
-    return scores.argmax().reshape(1)
+    return scores          # (K,) full scores; caller decides how to use them
 
 
 @torch.no_grad()
@@ -166,7 +172,8 @@ def main(cfg):
     num_actions = extract_state_dict(sd, "actor_critic")["actor_linear.weight"].shape[0]
     print(f"MODE={MODE}, num_actions={num_actions}"
           + (f", H_VETO={H_VETO}, VETO_THRESH={VETO_THRESH}, ESCAPE_MARGIN={ESCAPE_MARGIN}"
-             if MODE == "veto" else ""))
+             if MODE == "veto" else "")
+          + (f", H={H}, SPREAD_THRESH={SPREAD_THRESH}" if MODE == "gate" else ""))
 
     world_model = WorldModel(obs_vocab_size=cfg.tokenizer.vocab_size,
                              act_vocab_size=num_actions, config=wm_config)
@@ -231,9 +238,10 @@ def main(cfg):
         ep_deaths.append(n_deaths)
         ep_steps.append(step + 1)
         ep_vetoes.append(n_veto)
+        label = {"veto": "vetoes", "gate": "takeovers"}.get(MODE)
         print(f"ep {ep+1:2d}/{N_EPISODES}: return {total_reward:5.0f}  "
               f"deaths {n_deaths}  steps {step+1:4d}"
-              + (f"  vetoes {n_veto}" if MODE == "veto" else ""))
+              + (f"  {label} {n_veto}" if label else ""))
 
     def stats(x):
         x = torch.tensor(x, dtype=torch.float32)
@@ -250,9 +258,10 @@ def main(cfg):
           f"median {sorted(ep_returns)[len(ep_returns)//2]:.0f}")
     print(f"deaths: mean {d_mean:.2f} +/- {d_sem:.2f} (sem)")
     print(f"steps:  mean {s_mean:.0f}")
-    if MODE == "veto":
+    if MODE in ("veto", "gate"):
         v_mean, _ = stats(ep_vetoes)
-        print(f"vetoes: mean {v_mean:.1f} per episode")
+        label = "vetoes" if MODE == "veto" else "takeovers"
+        print(f"{label}: mean {v_mean:.1f} per episode")
     print(f"raw returns: {[int(x) for x in ep_returns]}")
     print(f"raw deaths:  {ep_deaths}")
 
