@@ -237,12 +237,12 @@ def main(cfg):
                 spread = (top2[0] - top2[1]).item()
                 if spread > SPREAD_THRESH:
                     action = int(scores.argmax().item())   # evidence clears noise floor
-                    n_veto += 1                            # reuse counter: takeovers
-		    source = "Planner 接管"
+                    n_veto += 1                            # reuse counter
+                    source = "Planner 接管"
                 else:
                     action = actor_action                  # defer to the actor
-		    source = "Actor 接管"
-	    print(f" [Decision] Actor origin:{actor_aciton} | Spread: {spread:.4f} | final action:{action} ({source}\n")
+                    source = "Actor 接管"
+            print(f" [Decision] Actor origin:{actor_aciton} | Spread: {spread:.4f} | final action:{action} ({source}\n")
 
             elif MODE == "veto":
                 pd = death_probs(tokenizer, world_model, actor_critic, obs_t, device,
