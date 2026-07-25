@@ -121,9 +121,9 @@ def plan(tokenizer, world_model, actor_critic, obs, device, num_actions, H, gamm
 
             actions = Categorical(logits=ac_out.logits_actions.squeeze(1) / TEMPERATURE).sample()
 
-	    trajectory_confidence += alive * dist.log_prob(actions)
+            trajectory_confidence += alive * dist.log_prob(actions)
 
-	imagined_obs, exp_r, p_done = imagination_step(wm_env, actions)
+        imagined_obs, exp_r, p_done = imagination_step(wm_env, actions)
         cum_reward = cum_reward + discount * alive * exp_r
         alive = alive * (1.0 - p_done)
         discount = discount * gamma
