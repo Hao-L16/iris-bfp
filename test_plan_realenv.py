@@ -211,8 +211,19 @@ def main(cfg):
             if MODE == "actor":
                 action = actor_action
             elif MODE == "plan":
-                action = plan(tokenizer, world_model, actor_critic, obs_t, device,
-                              num_actions, H, GAMMA).item()
+                scores = plan(tokenizer, world_model, actor_critic, obs_t, device,
+                              num_actions, H, GAMMA)
+                action = int(scores.argmax().item())
+            elif MODE == "gate":
+                scores = plan(tokenizer, world_model, actor_critic, obs_t, device,
+                              num_actions, H, GAMMA)
+                top2 = torch.topk(scores, 2).values
+                spread = (top2[0] - top2[1]).item()
+                if spread > SPREAD_THRESH:
+                    action = int(scores.argmax().item())   # evidence clears noise floor
+                    n_veto += 1                            # reuse counter: takeovers
+                else:
+                    action = actor_action                  # defer to the actor
             elif MODE == "veto":
                 pd = death_probs(tokenizer, world_model, actor_critic, obs_t, device,
                                  num_actions, H_VETO)
