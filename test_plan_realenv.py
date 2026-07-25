@@ -109,19 +109,35 @@ def plan(tokenizer, world_model, actor_critic, obs, device, num_actions, H, gamm
     cum_reward = torch.zeros(K, device=device)
     alive = torch.ones(K, device=device)
     discount = 1.0
+    trajectory_confidence = torch.zeros(K,device=device)
+
     for t in range(H):
         if t == 0:
             actions = torch.arange(K, device=device)
         else:
             ac_out = actor_critic(imagined_obs)
-            actions = Categorical(
-                logits=ac_out.logits_actions.squeeze(1) / TEMPERATURE).sample()
-        imagined_obs, exp_r, p_done = imagination_step(wm_env, actions)
+
+            dist = Categorical(logits=ac_out.logits_actions.squeeze(1))
+
+            actions = Categorical(logits=ac_out.logits_actions.squeeze(1) / TEMPERATURE).sample()
+
+	    trajectory_confidence += alive * dist.log_prob(actions)
+
+	imagined_obs, exp_r, p_done = imagination_step(wm_env, actions)
         cum_reward = cum_reward + discount * alive * exp_r
         alive = alive * (1.0 - p_done)
         discount = discount * gamma
+
     final_value = actor_critic(imagined_obs).means_values.reshape(K)
-    scores = cum_reward + discount * alive * final_value
+
+    PENALTY_COEF = 0.1
+    raw_scores = cum_reward + discount * alive * final_value
+    scores = raw_scores + PENALTY_COEF * trajectory_confidence
+
+    best_planner = scores.argmax().item()
+    print(f" [Imagine] E[r] sum {[round(x,4) for x in cum_reward.tolist()]} "
+          f"V(end) {[round(x,3) for x in final_value.tolist()]} "
+          f"scores {[round(x,4) for x in scores.tolist()]} -> Planner : {best_planner}")
 
     actor_critic.hx, actor_critic.cx = saved
     return scores          # (K,) full scores; caller decides how to use them
@@ -222,8 +238,12 @@ def main(cfg):
                 if spread > SPREAD_THRESH:
                     action = int(scores.argmax().item())   # evidence clears noise floor
                     n_veto += 1                            # reuse counter: takeovers
+		    source = "Planner 接管"
                 else:
                     action = actor_action                  # defer to the actor
+		    source = "Actor 接管"
+	    print(f" [Decision] Actor origin:{actor_aciton} | Spread: {spread:.4f} | final action:{action} ({source}\n")
+
             elif MODE == "veto":
                 pd = death_probs(tokenizer, world_model, actor_critic, obs_t, device,
                                  num_actions, H_VETO)
