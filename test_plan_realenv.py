@@ -242,8 +242,7 @@ def main(cfg):
                 else:
                     action = actor_action                  # defer to the actor
                     source = "Actor 接管"
-            print(f" [Decision] Actor origin:{actor_aciton} | Spread: {spread:.4f} | final action:{action} ({source}\n")
-
+                print(f" [Decision] Actor origin:{actor_action} | Spread: {spread:.4f} | final action:{action} ({source})\n")
             elif MODE == "veto":
                 pd = death_probs(tokenizer, world_model, actor_critic, obs_t, device,
                                  num_actions, H_VETO)
