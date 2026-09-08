@@ -37,7 +37,7 @@ Run from repo root:
     PYTHONPATH=src python test_plan_realenv.py
 Set DEVICE = "cuda:0" on Colab.
 """
-
+import os
 import hydra
 from hydra.utils import instantiate
 import torch
@@ -52,7 +52,7 @@ from envs.wrappers import make_atari
 from utils import extract_state_dict
 
 DEVICE = "cpu"                  # "cuda:0" on Colab
-CHECKPOINT = "/home/lhao16/iris/checkpoints/last.pt"
+CHECKPOINT = os.environ.get("IRIS_CHECKPOINT", "checkpoints/last.pt")
 MODE = "gate"                   # "actor" | "plan" | "veto" | "gate"
 N_EPISODES = 20                 # episodes to average over
 N_STEPS = 2000                  # per-episode step cap (episode ends on its own first)

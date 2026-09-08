@@ -25,7 +25,7 @@ cost of plan() v3 per real step).
 """
 
 import csv
-
+import os
 import hydra
 from hydra.utils import instantiate
 import numpy as np
@@ -41,7 +41,7 @@ from envs.wrappers import make_atari
 from utils import extract_state_dict
 
 DEVICE = "cpu"                  # "cuda:0" on Colab
-CHECKPOINT = "/home/lhao16/iris/checkpoints/last.pt"
+CHECKPOINT = os.environ.get("IRIS_CHECKPOINT", "checkpoints/last.pt")
 N_STEPS = 2000                  # episode ends on its own before this
 H_PROBE = 20                    # diagnostic horizon (80 game frames)
 TEMPERATURE = 0.5               # actor sampling temperature (official eval)

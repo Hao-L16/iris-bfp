@@ -136,3 +136,12 @@ dmypy.json
 .pyre/
 checkpoints/
 outputs/
+
+# Generated data (see Appendix B for how to regenerate)
+gguf/
+eval_outputs/
+results/
+*.npy
+*.gguf
+*.bin
+*.pt

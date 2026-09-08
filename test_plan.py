@@ -11,7 +11,7 @@ Run from the repo root (~/iris):
 
 On Colab (GPU), set DEVICE = "cuda:0" below.
 """
-
+import os
 import hydra
 from hydra.utils import instantiate
 import torch
@@ -27,7 +27,7 @@ from utils import extract_state_dict
 # Config you may want to touch
 # ---------------------------------------------------------------------------
 DEVICE = "cpu"          # "cuda:0" on Colab
-CHECKPOINT = "/home/lhao16/iris/checkpoints/last.pt"
+CHECKPOINT = os.environ.get("IRIS_CHECKPOINT", "checkpoints/last.pt")
 K = 4                   # number of candidate action sequences
 H = 5                   # imagination horizon (steps)
 GAMMA = 0.995           # trainer.yaml: training.actor_critic.gamma
