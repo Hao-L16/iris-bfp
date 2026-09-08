@@ -1,3 +1,97 @@
+# iris-bfp
+
+> **This is a fork.** The original IRIS README follows below, unchanged. This
+> section describes what has been added.
+
+A fork of [IRIS](https://github.com/eloialonso/iris) extended with the tooling
+for an MSc dissertation on low-bit quantisation of discrete-token world models.
+Nothing in the original training pipeline has been modified — the additions
+export the trained checkpoint to GGUF, record reproducible traces, and provide
+a PyTorch reference for verifying a C++ port.
+
+The C++/GGML runtime that consumes all of this lives in
+[iris-cpp](https://github.com/Hao-L16/iris-cpp).
+
+## What was added
+
+### Export
+
+| Script | What it does |
+|---|---|
+| `convert_iris_to_gguf.py` | Exports the IRIS checkpoint to GGUF, one file per component (`iris-tokenizer-f32.gguf`, `iris-worldmodel-f32.gguf`, `iris-actorcritic-f32.gguf`) so each can be developed and verified alone. 578 tensors in total, with no restructuring — each keeps its name, shape and values, so any discrepancy in the port is attributable to the compute graph rather than to the export. |
+
+### Reference activations
+
+`dump_tok.py`, `dump_wm.py` and `dump_ac.py` instrument the PyTorch model and
+dump intermediate activations at 80 points across the three components — after
+each convolution and normalisation in the tokeniser, after attention and each
+MLP stage in every Transformer block, at the codebook lookup, and at each
+output head. The C++ implementation is required to reproduce every one of them
+from the same input.
+
+These write to `~/iris-cpp/ref` by default. Edit `OUT` at the head of each
+script if your checkout lives elsewhere.
+
+Two criteria apply, and the distinction is the point. Continuous intermediates
+are judged on **relative** error — an activation of magnitude 50 and one of
+magnitude 0.001 tolerate very different absolute deviations. The discrete path
+is judged on **exactness**: a model whose outputs are consumed as categorical
+choices is verified not by how close its logits are but by whether it chooses
+the same thing.
+
+### Traces
+
+| Script | What it does |
+|---|---|
+| `dump_trace_agent.py` | Drives the environment with the trained agent and records a reproducible trace: frames, tokens, actions and dones. |
+| `dump_trace.py` | The earlier random-policy version, kept for reference. |
+
+The switch from random policy to agent-driven traces is a correction, not a
+preference. A random policy dies quickly against the dense early wall, so its
+states are unrepresentative in a way that **changes conclusions and not merely
+their precision**: on random-policy traces the termination head is the
+sensitive one and the reward head is saturated, and on agent-driven traces the
+ordering reverses. Use `dump_trace_agent.py`.
+
+### PyTorch reference for the port
+
+| Script | What it does |
+|---|---|
+| `tf_pytorch.py` | Teacher-forced replay in PyTorch, mirroring `tf.cpp` exactly, to measure the baseline argmax mismatch rate between the C++ port and the reference model. |
+| `tf_pytorch_all.py` | The same over all five traces. |
+| `margin_headroom.py` | Per-position headroom between the C++/PyTorch margin discrepancy and the margin itself. The statement has to be made per position rather than globally, because the smallest margin anywhere is not larger than the largest discrepancy anywhere on some traces — the two extremes fall at different positions. |
+
+**Two traps if you repeat this.** These scripts read the per-seed trace
+directories directly rather than the working copy the C++ runner consumes, so
+the comparison cannot be run against a stale trace. And they reproduce the
+*reference implementation* rather than the port's description of it: action
+tokens occupy a separate embedding table indexed by the raw action, where the
+GGUF export concatenates that table with the observation table into one of 516
+rows. Following the exported layout in PyTorch produces a program that runs and
+computes a different function.
+
+### Planner experiments
+
+| Script | What it does |
+|---|---|
+| `test_plan_realenv.py` | Three integration modes in one harness for a like-for-like comparison: `actor` (stock actor-critic, the baseline), `plan` (enumerative one-step lookahead, decides by argmax), and `veto` (the actor decides by default; imagination only overrides when it predicts a life loss and a clearly safer action exists). |
+| `test_plan_clean.py` | The gate baseline with no trajectory-confidence term. Adding the actor's log-prob to the scores feeds the actor's own preference back into the ranking and inflates the score spread so much that the gate stops gating — takeovers went from ~10 per episode to ~150. |
+| `test_plan.py` | A function-level smoke test: verifies that a Transformer-in-the-loop planner runs end to end and returns a legal action, before wiring it into `agent.act()`. |
+| `probe_death.py` | Establishes that the world model anticipates life losses — none missed over an episode, median lead ~14 steps — but over-warns, firing dozens of times per episode against four real events. This is why a naive "veto whenever p_death is high" over-intervenes. |
+
+Set `IRIS_CHECKPOINT` to point at the checkpoint; it defaults to
+`checkpoints/last.pt`.
+
+## Not included
+
+Weights, traces and generated `.npy` intermediates are excluded — they are
+large, and the IRIS checkpoint is not mine to redistribute. Train or download
+the checkpoint following the original instructions below, then regenerate the
+rest with the scripts above.
+
+---
+
+*The original IRIS README follows.*
 # Transformers are Sample-Efficient World Models (IRIS)
 
 [Transformers are Sample-Efficient World Models](https://openreview.net/forum?id=vhFu1Acb0xb) <br>
